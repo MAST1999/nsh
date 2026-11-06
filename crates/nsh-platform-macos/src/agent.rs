@@ -3,6 +3,9 @@
 //! there, posted to the app as the system posts it ([`crate::synth`]).
 //! The agent calls from a thread of its own; each call does its work on
 //! the main queue (`exec_sync`) and returns once the input is posted.
+//! Pointer input goes to the window the agent targets (the main one, or a
+//! window of the app's own, by its root node), keys to the window that has
+//! the keyboard; a view's bounds are in its own window's content.
 
 use std::{
     rc::Rc,
@@ -12,7 +15,8 @@ use std::{
 
 use dispatch2::DispatchQueue;
 use nsh_core::{
-    NodeId,
+    NodeId, ROOT_ID,
+    desktop::WindowState,
     geometry::{Bounds, Point, Points, Size, point},
 };
 use nsh_testing::agent::{Key, Native};
@@ -51,6 +55,8 @@ pub(crate) struct MacNative {
     key: u64,
     /// The last left button press, which the next one may follow.
     last_click: Mutex<Option<Click>>,
+    /// The window pointer input goes to, by its root node.
+    target: Mutex<NodeId>,
 }
 
 impl MacNative {
@@ -58,7 +64,12 @@ impl MacNative {
         MacNative {
             key,
             last_click: Mutex::new(None),
+            target: Mutex::new(ROOT_ID),
         }
+    }
+
+    fn target(&self) -> NodeId {
+        *self.target.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// The click count of a left button press at `(x, y)` now: the window
@@ -88,9 +99,27 @@ impl MacNative {
         count
     }
 
-    /// `f` with the surface and its window, on the main queue, waited for;
-    /// `None` once either is gone.
+    /// `f` with the surface and its main window, on the main queue,
+    /// waited for; `None` once either is gone.
     fn on_main<R: Send>(&self, f: impl FnOnce(&Rc<Surface>, &NSWindow) -> R + Send) -> Option<R> {
+        self.on_window(Which::Main, f)
+    }
+
+    /// [`Self::on_main`] with the window the agent targets.
+    fn on_target<R: Send>(&self, f: impl FnOnce(&Rc<Surface>, &NSWindow) -> R + Send) -> Option<R> {
+        self.on_window(Which::Target(self.target()), f)
+    }
+
+    /// [`Self::on_main`] with the window that has the keyboard.
+    fn on_key<R: Send>(&self, f: impl FnOnce(&Rc<Surface>, &NSWindow) -> R + Send) -> Option<R> {
+        self.on_window(Which::Key, f)
+    }
+
+    fn on_window<R: Send>(
+        &self,
+        which: Which,
+        f: impl FnOnce(&Rc<Surface>, &NSWindow) -> R + Send,
+    ) -> Option<R> {
         let key = self.key;
         let mut out = None;
         let slot = &mut out;
@@ -98,7 +127,12 @@ impl MacNative {
             let Some(surface) = Surface::with_key(key) else {
                 return;
             };
-            let Some(window) = surface.root.ns().window() else {
+            let window = match which {
+                Which::Main => surface.root.ns().window(),
+                Which::Target(id) => crate::window::window_of(&surface, id),
+                Which::Key => crate::window::key_window(&surface),
+            };
+            let Some(window) = window else {
                 return;
             };
             *slot = Some(f(&surface, &window));
@@ -109,7 +143,7 @@ impl MacNative {
     /// A frame of the screen showing the window: a trackpad sends its
     /// gesture's events at the display's rate (120 Hz on ProMotion).
     fn frame(&self) -> Duration {
-        self.on_main(|_, window| {
+        self.on_target(|_, window| {
             let rate = window.screen()?.maximumFramesPerSecond();
             (rate > 0).then(|| Duration::from_secs_f64(1.0 / rate as f64))
         })
@@ -143,10 +177,21 @@ impl MacNative {
     }
 }
 
-/// `rect` of view `ns` in the window's content, from its top left; `None`
-/// when the view is not in the window or hidden.
-fn in_window(ns: &NSView, rect: NSRect, window: &NSWindow) -> Option<Bounds<Points>> {
-    if ns.window().is_none() || ns.isHiddenOrHasHiddenAncestor() {
+/// Which of the surface's windows a call acts in.
+#[derive(Clone, Copy)]
+enum Which {
+    Main,
+    /// A window by its root node (the main one's is the root).
+    Target(NodeId),
+    /// The window that has the keyboard.
+    Key,
+}
+
+/// `rect` of view `ns` in its window's content, from its top left; `None`
+/// when the view is in no window or hidden.
+fn in_window(ns: &NSView, rect: NSRect) -> Option<Bounds<Points>> {
+    let window = ns.window()?;
+    if ns.isHiddenOrHasHiddenAncestor() {
         return None;
     }
     // Window coordinates (from the bottom left), as the content view's are.
@@ -166,22 +211,22 @@ fn in_window(ns: &NSView, rect: NSRect, window: &NSWindow) -> Option<Bounds<Poin
 
 impl Native for MacNative {
     fn bounds(&self, id: NodeId) -> Option<Bounds<Points>> {
-        self.on_main(|surface, window| {
+        self.on_main(|surface, _| {
             let mounter = surface.mounter.borrow();
             let view = mounter.views.get(&id)?;
             crate::scroll::commit_ancestors(view);
-            in_window(view.ns(), view.ns().bounds(), window)
+            in_window(view.ns(), view.ns().bounds())
         })
         .flatten()
     }
 
     fn text_bounds(&self, text: NodeId, start: u32, end: u32) -> Option<Bounds<Points>> {
-        self.on_main(|surface, window| {
+        self.on_main(|surface, _| {
             let mounter = surface.mounter.borrow();
             let view = mounter.views.get(&text)?;
             crate::scroll::commit_ancestors(view);
             let rect = *crate::text::range_rects(&view.state(), start, end).first()?;
-            in_window(view.ns(), rect, window)
+            in_window(view.ns(), rect)
         })
         .flatten()
     }
@@ -199,7 +244,7 @@ impl Native for MacNative {
     fn press(&self, at: Point<Points>) {
         self.activate();
         let (x, y) = (f64::from(at.x.0), f64::from(at.y.0));
-        self.on_main(|_, window| {
+        self.on_target(|_, window| {
             let clicks = self.click_count(x, y);
             // A real pointer arrives before it presses (hover state).
             synth::mouse(window, NSEventType::MouseMoved, x, y, 0);
@@ -211,7 +256,7 @@ impl Native for MacNative {
     fn long_press(&self, at: Point<Points>, hold: Duration) {
         self.activate();
         let (x, y) = (f64::from(at.x.0), f64::from(at.y.0));
-        let clicks = self.on_main(|_, window| {
+        let clicks = self.on_target(|_, window| {
             let clicks = self.click_count(x, y);
             synth::mouse(window, NSEventType::MouseMoved, x, y, 0);
             synth::mouse(window, NSEventType::LeftMouseDown, x, y, clicks);
@@ -219,7 +264,7 @@ impl Native for MacNative {
         });
         std::thread::sleep(hold);
         let clicks = clicks.unwrap_or(1);
-        self.on_main(|_, window| synth::mouse(window, NSEventType::LeftMouseUp, x, y, clicks));
+        self.on_target(|_, window| synth::mouse(window, NSEventType::LeftMouseUp, x, y, clicks));
     }
 
     fn scroll(&self, at: Point<Points>, delta: Point<Points>) {
@@ -232,7 +277,7 @@ impl Native for MacNative {
         let frame = self.frame();
         let mut next = Instant::now();
         let mut gesture = |dx: i32, dy: i32, phase: i64| {
-            self.on_main(move |_, window| {
+            self.on_target(move |_, window| {
                 synth::wheel_with(window, x, y, dx, dy, Some(phase), 0, synth::timestamp());
             });
             next += frame;
@@ -253,7 +298,7 @@ impl Native for MacNative {
         self.activate();
         let (x, y) = (f64::from(from.x.0), f64::from(from.y.0));
         let clicks = self
-            .on_main(move |_, window| {
+            .on_target(move |_, window| {
                 let clicks = self.click_count(x, y);
                 synth::mouse(window, NSEventType::MouseMoved, x, y, 0);
                 synth::mouse(window, NSEventType::LeftMouseDown, x, y, clicks);
@@ -265,23 +310,25 @@ impl Native for MacNative {
         for at in nsh_testing::agent::drag_path(from, to) {
             std::thread::sleep(nsh_testing::agent::FRAME);
             let (x, y) = (f64::from(at.x.0), f64::from(at.y.0));
-            self.on_main(move |_, window| {
+            self.on_target(move |_, window| {
                 synth::mouse(window, NSEventType::LeftMouseDragged, x, y, clicks);
             });
             last = at;
         }
         let (x, y) = (f64::from(last.x.0), f64::from(last.y.0));
-        self.on_main(move |_, window| synth::mouse(window, NSEventType::LeftMouseUp, x, y, clicks));
+        self.on_target(move |_, window| {
+            synth::mouse(window, NSEventType::LeftMouseUp, x, y, clicks)
+        });
     }
 
     fn type_text(&self, text: &str) {
         let text = text.to_owned();
-        self.on_main(move |surface, window| synth::type_text(surface, window, &text));
+        self.on_key(move |surface, window| synth::type_text(surface, window, &text));
     }
 
     fn paste(&self, content: &nsh_core::PasteEvent) -> Result<(), String> {
         let content = content.clone();
-        self.on_main(move |_, window| crate::text_input::test_paste(window, &content))
+        self.on_key(move |_, window| crate::text_input::test_paste(window, &content))
             .unwrap_or_else(|| Err("the window is gone".into()))
     }
 
@@ -291,7 +338,7 @@ impl Native for MacNative {
             Key::Backspace => "BackSpace",
             Key::SelectAll => "cmd+a",
         };
-        self.on_main(move |surface, window| synth::key(surface, window, name));
+        self.on_key(move |surface, window| synth::key(surface, window, name));
     }
 
     fn mouse(&self) -> bool {
@@ -303,7 +350,7 @@ impl Native for MacNative {
         // Another button's press ends a run of left clicks.
         *self.last_click.lock().unwrap_or_else(|e| e.into_inner()) = None;
         let (x, y) = (f64::from(at.x.0), f64::from(at.y.0));
-        self.on_main(move |_, window| {
+        self.on_target(move |_, window| {
             synth::mouse(window, NSEventType::RightMouseDown, x, y, 1);
             synth::mouse(window, NSEventType::RightMouseUp, x, y, 1);
         })
@@ -325,7 +372,7 @@ impl Native for MacNative {
         let (x, y) = (f64::from(at.x.0), f64::from(at.y.0));
         // Straight to the surface's input: AppKit hands a posted mouse
         // move to the first responder only, not to the view under it.
-        self.on_main(move |surface, window| {
+        self.on_target(move |surface, window| {
             let event = synth::mouse_event(
                 window,
                 NSEventType::MouseMoved,
@@ -335,7 +382,13 @@ impl Native for MacNative {
                 objc2_app_kit::NSEventModifierFlags::empty(),
             );
             if let Some(event) = event {
+                let target = self.target();
+                let root = (target != ROOT_ID)
+                    .then(|| crate::window::root_view(surface, target))
+                    .flatten();
+                crate::input::enter(surface, root);
                 crate::input::event(surface, &event);
+                crate::input::enter(surface, None);
             }
         })
         .ok_or_else(|| "the window is gone".to_owned())
@@ -378,7 +431,7 @@ impl Native for MacNative {
             Key::F(n) => format!("F{n}"),
         });
         self.activate();
-        self.on_main(move |surface, window| synth::key(surface, window, &name))
+        self.on_key(move |surface, window| synth::key(surface, window, &name))
             .ok_or_else(|| "the window is gone".to_owned())
     }
 
@@ -393,7 +446,7 @@ impl Native for MacNative {
     fn back(&self) -> Result<(), String> {
         // Escape, as a user goes back: in a focused field it only leaves
         // it, so then once more.
-        self.on_main(|surface, window| {
+        self.on_key(|surface, window| {
             if crate::text_input::editing(surface) {
                 synth::key(surface, window, "Escape");
             }
@@ -426,16 +479,53 @@ impl Native for MacNative {
     }
 
     fn set_dark(&self, dark: bool) -> Result<(), String> {
-        self.on_main(move |_, window| {
+        self.on_main(move |surface, window| {
             // SAFETY: immutable AppKit constants.
             let name = if dark {
                 unsafe { NSAppearanceNameDarkAqua }
             } else {
                 unsafe { NSAppearanceNameAqua }
             };
-            window.setAppearance(NSAppearance::appearanceNamed(name).as_deref());
+            let appearance = NSAppearance::appearanceNamed(name);
+            window.setAppearance(appearance.as_deref());
+            // Every window of the app's own follows, those it opens later
+            // too (they inherit the application's), but for a window with
+            // a color scheme of its own.
+            NSApplication::sharedApplication(MainThreadMarker::from(window))
+                .setAppearance(appearance.as_deref());
+            crate::window::set_appearance(surface, appearance.as_deref());
         })
         .ok_or_else(|| "the window is gone".to_owned())
+    }
+
+    fn window_screenshot(&self, window: NodeId) -> Result<Vec<u8>, String> {
+        self.on_main(move |surface, _| {
+            let window =
+                crate::window::window_of(surface, window).ok_or("no such window is open")?;
+            synth::shot(&window)
+        })
+        .unwrap_or_else(|| Err("the window is gone".into()))
+    }
+
+    fn target_window(&self, window: NodeId) -> Result<(), String> {
+        let open = self
+            .on_main(move |surface, _| crate::window::window_of(surface, window).is_some())
+            .ok_or_else(|| "the window is gone".to_owned())?;
+        if !open {
+            return Err("no such window is open".into());
+        }
+        *self.target.lock().unwrap_or_else(|e| e.into_inner()) = window;
+        Ok(())
+    }
+
+    fn window_state(&self, window: NodeId) -> Result<Option<WindowState>, String> {
+        self.on_main(move |surface, _| crate::window::state(surface, window))
+            .ok_or_else(|| "the window is gone".to_owned())
+    }
+
+    fn press_window_close(&self, window: NodeId) -> Result<(), String> {
+        self.on_main(move |surface, _| crate::window::press_close_button(surface, window))
+            .unwrap_or_else(|| Err("the window is gone".to_owned()))
     }
 
     fn quit(&self) {
